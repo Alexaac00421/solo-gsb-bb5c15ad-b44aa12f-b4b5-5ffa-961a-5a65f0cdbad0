@@ -14,7 +14,15 @@
   （ACCESS SHARE）不受阻塞。SQLite 无表锁语法，依赖单写库锁（首次 INSERT 后
   持有写锁）+ busy_timeout 等待。整段登记在单事务内原子提交，任何失败整体
   回滚，不会留下部分清单或部分状态变更。
+
+历史温控证据报告为只读功能：PostgreSQL 下在事务第一条语句设置
+「ISOLATION LEVEL REPEATABLE READ, READ ONLY」，整份报告（读数、更正链、
+温区调整、位置交接、故障影响清单）取自同一个一致性快照，报告期间并发的读数
+更正或故障登记不会混入；READ ONLY 从数据库层保证报告不会改动隔离、交接与
+审计；普通快照读取与写事务互不阻塞（ACCESS SHARE 不与 EXCLUSIVE 表锁冲突）。
+SQLite 本地调试无对应语法，依赖单写库锁与只读事务快照，同事务内读取同样一致。
 """
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select, text, update
@@ -581,3 +589,216 @@ def register_failure(db: Session, code: str, location: str,
     # ---- 5. 原子提交；空清单同样保存（仅故障行，无影响行）----
     db.commit()
     return failure, True, impacts
+
+
+# ---------------------------------------------------------------- 历史温控证据报告
+
+@dataclass
+class ReportReading:
+    """证据报告中的一条窗内读数（值与判定均按报告生成时的快照重放）。"""
+
+    id: int
+    recorded_at: datetime
+    original_value: float                 # 读数原值（永不修改）
+    final_value: float                    # 最终更正值（无更正即原值）
+    correction_count: int                 # 更正链长度
+    range_min: float                      # 记录时生效的允许温区下限
+    range_max: float                      # 记录时生效的允许温区上限
+    location: str                         # 记录时所在库位
+    original_out_of_range: bool           # 原始越界判定（历史留痕，保留不回写）
+    final_out_of_range: bool              # 按最终更正值 + 记录时温区的越界标示
+
+
+@dataclass
+class ReportFailure:
+    """证据报告中与查询窗相交的已固定故障影响（逐段一行）及交集时段。"""
+
+    failure_id: int
+    failure_code: str
+    failure_location: str
+    failure_start: datetime
+    failure_end: datetime
+    reason: str
+    operator: str
+    overlap_start: datetime               # 与查询窗的交集起（左闭）
+    overlap_end: datetime                 # 与查询窗的交集止（右开）
+    impact_overlap_start: datetime        # 故障登记时固定的位置重叠时段起
+    impact_overlap_end: datetime          # 故障登记时固定的位置重叠时段止
+    was_quarantined: bool                 # 故障登记时样品是否已隔离
+
+
+@dataclass
+class EvidenceReport:
+    """单个样品、单个 [start, end) 查询窗的历史温控证据报告（一致性快照）。
+
+    verdict 取值：
+    - COMPLIANT：窗内有读数，全部按最终值在记录时温区内，且无相交故障；
+    - NON_COMPLIANT：存在按最终值越界的读数，或存在与查询窗相交的已固定故障；
+    - INCONCLUSIVE：窗内无读数——即便没有故障，也不得据此判为合规。
+    """
+
+    sample_id: int
+    sample_code: str
+    start: datetime
+    end: datetime
+    generated_at: datetime
+    readings: list[ReportReading] = field(default_factory=list)
+    failures: list[ReportFailure] = field(default_factory=list)
+    final_oor_count: int = 0
+    original_oor_count: int = 0
+    verdict: str = "INCONCLUSIVE"
+
+
+def _effective_range_at(adjustments: list[TempRangeAdjustment], sample: Sample,
+                        at: datetime) -> tuple[float, float]:
+    """读数时刻 at 生效的允许温区。
+
+    取生效时间不晚于 at 的最后一次温区调整；同一生效时刻按调整记录 ID
+    较大者优先（与「同一时刻按记录 ID 较大者优先」的全局约定一致）。
+    早于全部调整的读数，其生效温区为最早一次调整保存的旧温区（即登记温区）；
+    从未调整过时才取样品当前温区（此时它就等于登记温区）。
+    """
+    chosen: TempRangeAdjustment | None = None
+    for adj in adjustments:  # 已按 (effective_at, id) 升序
+        if _as_utc(adj.effective_at) <= at:
+            chosen = adj  # 升序遍历：最后满足条件者即 (effective_at, id) 最大者
+    if chosen is not None:
+        return chosen.new_min, chosen.new_max
+    if adjustments:
+        return adjustments[0].old_min, adjustments[0].old_max
+    return sample.temp_min, sample.temp_max
+
+
+def _begin_snapshot_read(db: Session) -> None:
+    """开启只读一致性快照事务（BEGIN 必须是事务第一条语句）。
+
+    随后本事务所有 SELECT 共享同一快照，报告期间并发的读数更正或故障登记
+    （已提交）不会混入，HTML 与 CSV 之间也不会出现内容矛盾：
+    - PostgreSQL：通过执行选项开启 REPEATABLE READ + READ ONLY 事务（由方言
+      在事务开始时下发），READ ONLY 从数据库层禁止任何写操作；快照读与写事务
+      互不阻塞（ACCESS SHARE 不与登记使用的 EXCLUSIVE 表锁冲突）。
+    - SQLite：显式 BEGIN（deferred）以共享锁开启读事务，单连接内后续读全部
+      基于同一快照；若写者已持锁则立即得到 SQLITE_BUSY（OperationalError），
+      由路由按既有锁冲突处理提示重试，绝不退回「逐条读、中间被改写」的视图。
+
+    先 rollback() 结束 Session 上可能残留的（只读）事务，保证隔离级别在
+    事务开始前设置；报告自身从不写入，回滚不会丢弃任何更改。
+    """
+    db.rollback()
+    if db.get_bind().dialect.name == "postgresql":
+        db.connection(execution_options={
+            "isolation_level": "REPEATABLE READ",
+            "postgresql_readonly": True})
+    else:
+        db.execute(text("BEGIN"))
+
+
+def build_evidence_report(db: Session, sample_id: int,
+                          start: datetime, end: datetime) -> EvidenceReport:
+    """基于单一只读快照构建 [start, end) 内的历史温控证据报告。
+
+    start/end 统一为带 UTC 时区的 datetime；起始须早于结束、结束不得晚于
+    当前时刻，否则 DomainError(400)；样品不存在 DomainError(404)。
+    调用方通常在只读端点中使用：请求结束时依赖 Session 关闭释放事务。
+    同一 Session 再次调用前需先 rollback() 结束上一个快照事务。
+    """
+    # ---- 0. 时间窗校验（左闭右开；结束不晚于当前时间）----
+    start = _as_utc(start)
+    end = _as_utc(end)
+    if not start < end:
+        raise DomainError("时间窗无效：起始时间必须早于结束时间（时间窗左闭右开）")
+    if end > _now():
+        raise DomainError("时间窗无效：结束时间不得晚于当前时间")
+    # ---- 1. 快照事务第一条语句（PG）：之后所有读取同一视图 ----
+    _begin_snapshot_read(db)
+    sample = db.get(Sample, sample_id)
+    if sample is None:
+        raise DomainError("样品不存在", 404)
+
+    # ---- 2. 快照内取齐重放所需的全部原始事实 ----
+    all_readings = db.scalars(
+        select(TemperatureReading).where(TemperatureReading.sample_id == sample_id)
+        .order_by(TemperatureReading.id.asc())).all()
+    corrections = db.scalars(
+        select(ReadingCorrection).join(TemperatureReading)
+        .where(TemperatureReading.sample_id == sample_id)
+        .order_by(ReadingCorrection.id.asc())).all()
+    adjustments = db.scalars(
+        select(TempRangeAdjustment).where(TempRangeAdjustment.sample_id == sample_id)
+        .order_by(TempRangeAdjustment.effective_at.asc(),
+                  TempRangeAdjustment.id.asc())).all()
+    # 位置时间段：登记位置 + 已确认交接，确认时刻同时刻按交接 ID 较大者优先
+    segments = _position_segments(db, sample)
+    # 已固定的故障影响清单：登记后不随后续位置/状态变化，只读引用即可
+    impacts = db.scalars(
+        select(FailureImpact).where(FailureImpact.sample_id == sample_id)
+        .order_by(FailureImpact.id.asc())).all()
+    failure_rows = db.scalars(
+        select(EquipmentFailure)
+        .where(EquipmentFailure.id.in_(sorted({i.failure_id for i in impacts})))
+        .order_by(EquipmentFailure.id.asc())).all() if impacts else []
+    failure_map = {f.id: f for f in failure_rows}
+
+    # ---- 3. 逐条重放窗内读数 ----
+    corrections_by_reading: dict[int, list[ReadingCorrection]] = {}
+    for c in corrections:
+        corrections_by_reading.setdefault(c.reading_id, []).append(c)
+
+    report_readings: list[ReportReading] = []
+    for r in all_readings:
+        recorded_at = _as_utc(r.recorded_at)
+        if not (start <= recorded_at < end):  # 左闭右开
+            continue
+        chain = corrections_by_reading.get(r.id, [])
+        final_value = chain[-1].new_value if chain else r.value
+        range_min, range_max = _effective_range_at(adjustments, sample, recorded_at)
+        location = sample.initial_location or sample.current_location
+        for seg_loc, seg_start, seg_end in segments:
+            # 段为左闭右开；末段 seg_end 为 None 表示在库至今
+            if seg_start <= recorded_at and (seg_end is None or recorded_at < seg_end):
+                location = seg_loc
+                break
+        final_oor = final_value < range_min or final_value > range_max
+        report_readings.append(ReportReading(
+            id=r.id, recorded_at=recorded_at, original_value=r.value,
+            final_value=final_value, correction_count=len(chain),
+            range_min=range_min, range_max=range_max, location=location,
+            original_out_of_range=bool(r.is_out_of_range),
+            final_out_of_range=final_oor))
+
+    # ---- 4. 已固定故障影响中与查询窗相交者：交集时段 = 窗 ∩ 固定重叠时段 ----
+    report_failures: list[ReportFailure] = []
+    for imp in impacts:
+        f = failure_map.get(imp.failure_id)
+        if f is None:  # 理论上不会发生（外键），防御性跳过
+            continue
+        imp_start = _as_utc(imp.overlap_start)
+        imp_end = _as_utc(imp.overlap_end)
+        inter_start = max(start, imp_start)
+        inter_end = min(end, imp_end)
+        if inter_start >= inter_end:  # 左闭右开：无交集
+            continue
+        report_failures.append(ReportFailure(
+            failure_id=f.id, failure_code=f.code, failure_location=f.location,
+            failure_start=_as_utc(f.start_time), failure_end=_as_utc(f.end_time),
+            reason=f.reason, operator=f.operator,
+            overlap_start=inter_start, overlap_end=inter_end,
+            impact_overlap_start=imp_start, impact_overlap_end=imp_end,
+            was_quarantined=bool(imp.was_quarantined)))
+    # 按故障编号、交集起、影响记录 ID 稳定排序
+    report_failures.sort(key=lambda x: (x.failure_id, x.overlap_start))
+
+    final_oor_count = sum(1 for r in report_readings if r.final_out_of_range)
+    original_oor_count = sum(1 for r in report_readings if r.original_out_of_range)
+    if final_oor_count > 0 or report_failures:
+        verdict = "NON_COMPLIANT"
+    elif report_readings:
+        verdict = "COMPLIANT"
+    else:
+        verdict = "INCONCLUSIVE"  # 窗内无读数：即便无故障也不得判为合规
+
+    return EvidenceReport(
+        sample_id=sample_id, sample_code=sample.code, start=start, end=end,
+        generated_at=_now(), readings=report_readings, failures=report_failures,
+        final_oor_count=final_oor_count, original_oor_count=original_oor_count,
+        verdict=verdict)

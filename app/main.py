@@ -4,11 +4,12 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
@@ -36,6 +37,13 @@ EVENT_NAMES = {
     "FAULT_AFFECTED": "故障影响",
     "FAULT_LINKED": "故障关联（已隔离）",
     "TEMP_RANGE_ADJUSTED": "温区调整",
+}
+
+# 历史温控证据报告的总体判定名称
+VERDICT_NAMES = {
+    "COMPLIANT": "合规",
+    "NON_COMPLIANT": "不合规",
+    "INCONCLUSIVE": "无法判定（查询窗内无读数，不得判为合规）",
 }
 
 
@@ -141,8 +149,39 @@ def fmt_dt(value) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def fmt_utc(value) -> str:
+    """统一以 UTC ISO 8601（带 Z 后缀）展示证据报告时间，避免时区歧义。"""
+    if not value:
+        return "-"
+    if isinstance(value, str):
+        return value
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
 templates.env.filters["dt"] = fmt_dt
+templates.env.filters["utc"] = fmt_utc
 templates.env.filters["json_detail"] = lambda d: json.dumps(d or {}, ensure_ascii=False)
+
+
+def _datetime_local_value(dt: datetime | None) -> str:
+    """把 UTC datetime 转成 datetime-local 控件值（YYYY-MM-DDTHH:MM，UTC）。"""
+    if dt is None:
+        return ""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+
+def parse_report_window(start_raw: str | None, end_raw: str | None) -> tuple[datetime, datetime]:
+    """解析并校验证据报告查询窗（UTC，左闭右开）。
+
+    起止必填且可解析；起始须早于结束；结束不得晚于当前时刻，否则 DomainError。
+    """
+    start = services.parse_dt(start_raw or "", "起始时间")
+    end = services.parse_dt(end_raw or "", "结束时间")
+    if not start < end:
+        raise DomainError("时间窗无效：起始时间必须早于结束时间（时间窗左闭右开）")
+    if end > datetime.now(timezone.utc):
+        raise DomainError("时间窗无效：结束时间不得晚于当前时间")
+    return start, end
 
 
 def _minutes_between(pair) -> int:
@@ -285,6 +324,111 @@ def sample_detail(sample_id: int, request: Request, db: Session = Depends(get_db
                   quarantines=quarantines, audits=audits, pending=pending,
                   failure_map=failure_map, impacts_by_failure=impacts_by_failure,
                   adjustments=adjustments, event_names=EVENT_NAMES)
+
+
+# --------------------------------------------------- 历史温控证据报告
+
+def _get_report_or_error(sample_id: int, start_raw: str | None, end_raw: str | None,
+                         db: Session):
+    """解析查询窗并在单一只读快照内构建证据报告。
+
+    返回 report；参数/时间错误抛 DomainError(400)，样品不存在抛 DomainError(404)。
+    """
+    start, end = parse_report_window(start_raw, end_raw)
+    return services.build_evidence_report(db, sample_id, start, end)
+
+
+@app.get("/samples/{sample_id}/evidence", response_class=HTMLResponse)
+def sample_evidence(sample_id: int, request: Request,
+                    start: str | None = None, end: str | None = None,
+                    db: Session = Depends(get_db)):
+    sample = db.get(Sample, sample_id)
+    if sample is None:
+        return redirect("/", "样品不存在", "error")
+    try:
+        report = _get_report_or_error(sample_id, start, end, db)
+    except DomainError as e:
+        # 时间格式无法解析 / 起始不早于结束 / 结束晚于当前时间：原样展示明确原因
+        return redirect(f"/samples/{sample_id}", e.message, "error")
+    except OperationalError as e:
+        if _is_lock_conflict(e):
+            return lock_conflict_redirect(db, f"/samples/{sample_id}", "历史报告读取")
+        raise
+    return render(request, "evidence_report.html", sample=sample, report=report,
+                  verdict_names=VERDICT_NAMES,
+                  start_value=_datetime_local_value(report.start),
+                  end_value=_datetime_local_value(report.end))
+
+
+def _report_csv(report) -> str:
+    """把证据报告序列化为 CSV；与页面展示同一份数据，仅格式不同。"""
+    buf = io.StringIO()
+    buf.write("﻿")  # BOM，便于 Excel 打开中文
+    w = csv.writer(buf)
+    w.writerow(["历史温控证据报告"])
+    w.writerow(["样品编号", report.sample_code])
+    w.writerow(["样品ID", report.sample_id])
+    w.writerow(["查询起始（UTC，左闭）", fmt_utc(report.start)])
+    w.writerow(["查询结束（UTC，右开）", fmt_utc(report.end)])
+    w.writerow(["报告生成时间（UTC）", fmt_utc(report.generated_at)])
+    w.writerow(["总体判定", VERDICT_NAMES[report.verdict]])
+    w.writerow(["窗内读数条数", len(report.readings)])
+    w.writerow(["最终值越界条数", report.final_oor_count])
+    w.writerow(["原始判定越界条数（历史留痕）", report.original_oor_count])
+    w.writerow(["相交故障段数", len(report.failures)])
+    w.writerow([])
+
+    w.writerow(["窗内读数（按读数ID升序；左闭右开）"])
+    w.writerow(["读数ID", "记录时间(UTC)", "原值(°C)", "最终更正值(°C)", "更正次数",
+                "记录时生效温区下限(°C)", "记录时生效温区上限(°C)", "记录时所在库位",
+                "原始越界判定", "最终值越界标示"])
+    if report.readings:
+        for r in report.readings:
+            w.writerow([r.id, fmt_utc(r.recorded_at), r.original_value, r.final_value,
+                        r.correction_count, r.range_min, r.range_max, r.location,
+                        "是" if r.original_out_of_range else "否",
+                        "是" if r.final_out_of_range else "否"])
+    else:
+        w.writerow(["（查询窗内无读数；无读数不得判为合规）"])
+    w.writerow([])
+
+    w.writerow(["与查询窗相交的已固定故障影响（故障影响清单登记时固定，不随后续状态变化）"])
+    w.writerow(["故障ID", "故障编号", "库位", "故障开始(UTC)", "故障结束(UTC，右开)",
+                "与查询窗交集起(UTC，左闭)", "与查询窗交集止(UTC，右开)",
+                "登记时固定位置重叠起(UTC)", "登记时固定位置重叠止(UTC，右开)",
+                "登记时样品状态", "故障原因", "操作者"])
+    if report.failures:
+        for f in report.failures:
+            w.writerow([f.failure_id, f.failure_code, f.failure_location,
+                        fmt_utc(f.failure_start), fmt_utc(f.failure_end),
+                        fmt_utc(f.overlap_start), fmt_utc(f.overlap_end),
+                        fmt_utc(f.impact_overlap_start), fmt_utc(f.impact_overlap_end),
+                        "已隔离·仅关联" if f.was_quarantined else "未隔离·本次隔离",
+                        f.reason, f.operator])
+    else:
+        w.writerow(["（无已固定故障影响与查询窗相交）"])
+    return buf.getvalue()
+
+
+@app.get("/samples/{sample_id}/evidence.csv")
+def sample_evidence_csv(sample_id: int, start: str | None = None,
+                        end: str | None = None, db: Session = Depends(get_db)):
+    try:
+        report = _get_report_or_error(sample_id, start, end, db)
+    except DomainError as e:
+        return PlainTextResponse(e.message + "\n", status_code=e.status_code,
+                                 media_type="text/plain; charset=utf-8")
+    except OperationalError as e:
+        if _is_lock_conflict(e):
+            db.rollback()
+            return PlainTextResponse(
+                "历史报告读取与其他操作并发冲突，请稍后重试\n",
+                status_code=503, media_type="text/plain; charset=utf-8")
+        raise
+    filename = f"evidence_{report.sample_code}_{report.start.strftime('%Y%m%dT%H%M')}Z_{report.end.strftime('%Y%m%dT%H%M')}Z.csv"
+    return Response(
+        content=_report_csv(report), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 # ---------------------------------------------------------------- 操作

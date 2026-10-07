@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}历史温控证据报告 · 样品 {{ sample.code }}{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-head">
+    <h2>
+      历史温控证据报告 · 样品 {{ report.sample_code }}
+      {% if report.verdict == 'COMPLIANT' %}<span class="badge ok">{{ verdict_names[report.verdict] }}</span>
+      {% elif report.verdict == 'NON_COMPLIANT' %}<span class="badge bad">{{ verdict_names[report.verdict] }}</span>
+      {% else %}<span class="badge pending">{{ verdict_names[report.verdict] }}</span>{% endif %}
+    </h2>
+    <a class="btn" href="/samples/{{ sample.id }}">返回样品详情</a>
+  </div>
+  <p class="meta">
+    查询窗（UTC，左闭右开）：<b>{{ report.start | utc }} ~ {{ report.end | utc }}</b> ｜
+    报告生成时间（UTC）：{{ report.generated_at | utc }}<br>
+    窗内读数：<b>{{ report.readings | length }}</b> 条 ｜
+    最终值越界：<b class="{{ 'bad-text' if report.final_oor_count else '' }}">{{ report.final_oor_count }}</b> 条 ｜
+    原始判定越界（历史留痕）：<b>{{ report.original_oor_count }}</b> 条 ｜
+    相交故障段：<b class="{{ 'bad-text' if report.failures else '' }}">{{ report.failures | length }}</b> 段
+  </p>
+  {% if report.verdict == 'INCONCLUSIVE' %}
+  <p class="bad-text">查询窗内没有任何温度读数，本报告不得作为合规证据。</p>
+  {% elif report.verdict == 'NON_COMPLIANT' %}
+  <p class="bad-text">存在按最终更正值标示的越界读数，或存在与查询窗相交的已固定设备故障影响：判定不合规。</p>
+  {% else %}
+  <p class="hint">窗内读数按最终更正值均在记录时生效温区内，且无相交故障。原始越界判定仅作历史留痕保留。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h3>按 UTC 时间窗查询 / 下载</h3>
+  <form method="get" action="/samples/{{ sample.id }}/evidence" class="inline-form">
+    <label>起始时间（UTC，含）*
+      <input type="datetime-local" name="start" value="{{ start_value }}" step="60" required>
+    </label>
+    <label>结束时间（UTC，不含）*
+      <input type="datetime-local" name="end" value="{{ end_value }}" step="60" required>
+    </label>
+    <button type="submit" class="btn">查看报告</button>
+    <button type="submit" class="btn"
+            formaction="/samples/{{ sample.id }}/evidence.csv">下载同内容 CSV</button>
+  </form>
+  <p class="hint">
+    时间按 UTC 解释、左闭右开 [起始, 结束)；起始须早于结束，结束不晚于当前时间。
+    整份报告在单一只读一致性快照内生成，报告期间的并发读数更正或故障登记不会改变其内容。
+  </p>
+</div>
+
+<div class="card">
+  <h3>窗内温度读数（{{ report.readings | length }} 条，按读数 ID 升序）</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>读数ID</th><th>记录时间 (UTC)</th><th>原值 (°C)</th><th>最终更正值 (°C)</th>
+        <th>记录时生效允许温区 (°C)</th><th>记录时所在库位</th>
+        <th>原始越界判定</th><th>最终值越界标示</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in report.readings %}
+      <tr class="{{ 'row-bad' if r.final_out_of_range else '' }}">
+        <td>#{{ r.id }}</td>
+        <td>{{ r.recorded_at | utc }}</td>
+        <td>{{ r.original_value }}</td>
+        <td><b>{{ r.final_value }}</b>{% if r.correction_count %}<span class="hint">（更正 {{ r.correction_count }} 次）</span>{% endif %}</td>
+        <td>{{ r.range_min }} ~ {{ r.range_max }}</td>
+        <td>{{ r.location }}</td>
+        <td>
+          {% if r.original_out_of_range %}<span class="badge pending">原始越界</span>
+          {% else %}<span class="hint">否</span>{% endif %}
+        </td>
+        <td>
+          {% if r.final_out_of_range %}<span class="badge bad">越界</span>
+          {% else %}<span class="badge ok">在范围内</span>{% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="empty">查询窗内无读数（左闭右开）；此时即使无相交故障，也不得判为合规。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">
+    生效温区取「生效时间不晚于读数记录时间」的最后一次温区调整（同一生效时刻取记录 ID 较大者）；
+    所在库位取「确认时间不晚于读数记录时间」的最后一次已确认交接（同一时刻按交接 ID 较大者优先），无则为登记位置。
+    越界标示以最终更正值对照记录时生效温区；原始越界判定来自读数登记瞬间，保留不回写。
+  </p>
+</div>
+
+<div class="card">
+  <h3>与查询窗相交的已固定故障影响（{{ report.failures | length }} 段）</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>故障编号</th><th>库位</th><th>故障时段 (UTC，左闭右开)</th>
+        <th>与查询窗交集时段 (UTC)</th><th>登记时固定位置重叠时段 (UTC)</th>
+        <th>登记时样品状态</th><th>原因 / 操作者</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for f in report.failures %}
+      <tr class="row-bad">
+        <td><a href="/failures/{{ f.failure_id }}"><b>{{ f.failure_code }}</b></a></td>
+        <td>{{ f.failure_location }}</td>
+        <td>{{ f.failure_start | utc }} ~ {{ f.failure_end | utc }}</td>
+        <td><b>{{ f.overlap_start | utc }} ~ {{ f.overlap_end | utc }}</b></td>
+        <td>{{ f.impact_overlap_start | utc }} ~ {{ f.impact_overlap_end | utc }}</td>
+        <td>
+          {% if f.was_quarantined %}<span class="badge bad">已隔离·仅关联</span>
+          {% else %}<span class="badge pending">未隔离·本次隔离</span>{% endif %}
+        </td>
+        <td>{{ f.reason }}<div class="hint">{{ f.operator }}</div></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">无已固定故障影响与查询窗相交。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">
+    故障影响清单在故障登记时一次性固定，不随后续位置/隔离状态变化；只要与查询窗存在交集即列出，
+    并使本报告不得判为合规——即使窗内没有读数。
+  </p>
+</div>
+{% endblock %}

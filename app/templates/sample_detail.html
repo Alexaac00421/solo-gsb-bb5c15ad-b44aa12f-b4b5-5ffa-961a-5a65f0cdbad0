@@ -219,6 +219,22 @@
   <p class="hint">调整以提交时刻生效；历史读数原值、更正链、当时越界判定与已形成的隔离记录不回写；放宽温区不自动解除隔离。</p>
 </div>
 
+<div class="card highlight">
+  <h3>历史温控证据报告（按 UTC 时间窗）</h3>
+  <form method="get" action="/samples/{{ sample.id }}/evidence" class="inline-form">
+    <label>起始时间（UTC，含）*
+      <input type="datetime-local" name="start" step="60" required>
+    </label>
+    <label>结束时间（UTC，不含）*
+      <input type="datetime-local" name="end" step="60" required>
+    </label>
+    <button type="submit" class="btn">查看历史报告</button>
+    <button type="submit" class="btn"
+            formaction="/samples/{{ sample.id }}/evidence.csv">下载同内容 CSV</button>
+  </form>
+  <p class="hint">时间窗左闭右开，起始须早于结束且结束不晚于当前时间；报告逐条列出窗内读数的原值、最终更正值、记录时生效温区与所在库位，并列出相交的已固定故障影响；窗内无读数也展示故障，但不得判为合规。报告为只读一致性快照，不改变隔离、交接与历史审计。</p>
+</div>
+
 <div class="card">
   <h3>异常记录（隔离）</h3>
   <table>
