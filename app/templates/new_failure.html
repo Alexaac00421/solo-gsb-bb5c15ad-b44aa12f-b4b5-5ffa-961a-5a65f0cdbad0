@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}设备故障登记{% endblock %}
+{% block content %}
+<div class="card narrow">
+  <h2>冷库设备故障登记</h2>
+  <form method="post" action="/failures" class="form">
+    <label>故障编号 *
+      <input name="code" required placeholder="如 F-2026-0001">
+    </label>
+    <label>库位 *
+      <input name="location" required placeholder="如 冷库A-01（须与样品登记位置/交接目的地完全一致）">
+    </label>
+    <label>故障开始时间 *（左闭）
+      <input name="start_time" type="datetime-local" step="1" required>
+    </label>
+    <label>故障结束时间 *（右开，不得晚于当前提交时刻）
+      <input name="end_time" type="datetime-local" step="1" required>
+    </label>
+    <label>故障原因 *
+      <input name="reason" required placeholder="如 压缩机停转导致库温回升">
+    </label>
+    <label>操作者 *
+      <input name="operator" required placeholder="登记该故障的管理人员">
+    </label>
+    <button type="submit" class="btn">提交故障登记</button>
+  </form>
+  <p class="hint">
+    提交后系统按「样品登记位置 + 已确认交接」形成的位置时间线（左闭右开），
+    一次性固定与该库位故障时段有交集的样品及各自重叠时段；
+    其中当前未隔离的样品将被隔离、待确认交接失效，已隔离样品仅关联本故障。
+    相同编号及字段重复提交返回原结果，编号相同字段不同将提示冲突。
+    页面时间按 UTC 解释。
+  </p>
+</div>
+{% endblock %}

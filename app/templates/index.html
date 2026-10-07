@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="card-head">
+    <h2>样品列表</h2>
+    <a class="btn" href="/samples/new">+ 录入样品</a>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>编号</th><th>允许温区 (°C)</th><th>当前位置</th><th>状态</th>
+        <th>待确认交接</th><th>录入时间</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in samples %}
+      <tr>
+        <td><a href="/samples/{{ s.id }}"><b>{{ s.code }}</b></a></td>
+        <td>{{ s.temp_min }} ~ {{ s.temp_max }}</td>
+        <td>{{ s.current_location }}</td>
+        <td>
+          {% if s.status == 'ACTIVE' %}<span class="badge ok">在库</span>
+          {% else %}<span class="badge bad">隔离中</span>{% endif %}
+        </td>
+        <td>{{ pending_counts.get(s.id, 0) }}</td>
+        <td>{{ s.created_at | dt }}</td>
+        <td><a href="/samples/{{ s.id }}">详情</a> · <a href="/samples/{{ s.id }}/export.csv">导出审计</a></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">暂无样品，<a href="/samples/new">立即录入</a></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

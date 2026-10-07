@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+{% block title %}样品 {{ sample.code }}{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-head">
+    <h2>
+      样品 {{ sample.code }}
+      {% if sample.status == 'ACTIVE' %}<span class="badge ok">在库</span>
+      {% else %}<span class="badge bad">隔离中</span>{% endif %}
+    </h2>
+    <a class="btn" href="/samples/{{ sample.id }}/export.csv">导出完整审计记录 (CSV)</a>
+  </div>
+  <p class="meta">
+    允许温区：<b>{{ sample.temp_min }} ~ {{ sample.temp_max }} °C</b> ｜
+    当前位置：<b>{{ sample.current_location }}</b> ｜
+    状态版本：v{{ sample.version }} ｜ 录入时间：{{ sample.created_at | dt }}
+  </p>
+</div>
+
+{% if sample.status == 'QUARANTINED' %}
+<div class="card warn">
+  <h3>解除隔离（须填写注明理由的复核结论）</h3>
+  <form method="post" action="/samples/{{ sample.id }}/release" class="form inline-form">
+    <input type="hidden" name="expected_version" value="{{ sample.version }}">
+    <label>复核人 *<input name="released_by" required></label>
+    <label class="grow">复核结论 / 理由 *
+      <input name="reason" required placeholder="例如：复核确认为温度传感器故障，样品全程未实际超温">
+    </label>
+    <button type="submit" class="btn danger">解除隔离</button>
+  </form>
+</div>
+{% endif %}
+
+{% if failure_map %}
+<div class="card {{ 'warn' if sample.status == 'QUARANTINED' else '' }}">
+  <h3>关联设备故障（隔离依据）</h3>
+  <table>
+    <thead>
+      <tr><th>故障编号</th><th>库位</th><th>故障时段（左闭右开）</th><th>本样品重叠时段</th><th>登记时状态</th><th>操作者</th></tr>
+    </thead>
+    <tbody>
+      {% for fid, imps in impacts_by_failure.items() %}
+      {% set f = failure_map.get(fid) %}
+      {% if f %}
+      {% for imp in imps %}
+      <tr>
+        <td><a href="/failures/{{ f.id }}"><b>{{ f.code }}</b></a></td>
+        <td>{{ f.location }}</td>
+        <td>{{ f.start_time | dt }} ~ {{ f.end_time | dt }}</td>
+        <td>{{ imp.overlap_start | dt }} ~ {{ imp.overlap_end | dt }}</td>
+        <td>
+          {% if imp.was_quarantined %}<span class="badge bad">已隔离·仅关联</span>
+          {% else %}<span class="badge pending">未隔离·本次隔离</span>{% endif %}
+        </td>
+        <td>{{ f.operator }}</td>
+      </tr>
+      {% endfor %}
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">受影响清单在故障登记时一次性固定；解除隔离仍须使用上方「注明理由的复核结论」流程。</p>
+</div>
+{% endif %}
+
+<div class="grid">
+  <div class="card">
+    <h3>发起交接</h3>
+    {% if pending %}
+      <p class="hint">存在待确认交接 #{{ pending.id }}（→ {{ pending.destination }}），确认或失效前不能重复发起。</p>
+    {% elif sample.status == 'QUARANTINED' %}
+      <p class="bad-text">样品隔离中，禁止发起转移。</p>
+    {% else %}
+    <form method="post" action="/samples/{{ sample.id }}/handovers" class="form">
+      <label>交出人 *<input name="from_person" required></label>
+      <label>接收人 *<input name="to_person" required></label>
+      <label>目的地 *<input name="destination" required placeholder="如 实验室C-101"></label>
+      <label>备注 <input name="note"></label>
+      <button type="submit" class="btn">提交交接</button>
+    </form>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>记录温度</h3>
+    <form method="post" action="/samples/{{ sample.id }}/readings" class="form">
+      <label>温度 (°C) *<input name="value" type="number" step="0.1" required></label>
+      <label>记录人 *<input name="recorded_by" required></label>
+      <button type="submit" class="btn">记录</button>
+    </form>
+    <p class="hint">越界读数将立即隔离样品，并使待确认交接失效。</p>
+  </div>
+
+  <div class="card">
+    <h3>调整允许温区</h3>
+    <form method="post" action="/samples/{{ sample.id }}/temp-range" class="form">
+      <input type="hidden" name="expected_version" value="{{ sample.version }}">
+      <label>新下限 (°C) *<input name="new_min" type="number" step="0.1" required placeholder="当前 {{ sample.temp_min }}"></label>
+      <label>新上限 (°C) *<input name="new_max" type="number" step="0.1" required placeholder="当前 {{ sample.temp_max }}"></label>
+      <label>调整理由 *<input name="reason" required placeholder="例如：实验方案 v3 变更储存条件"></label>
+      <label>操作者姓名 *<input name="operator" required></label>
+      <button type="submit" class="btn">提交调整（提交时刻生效）</button>
+    </form>
+    <p class="hint">下限须小于上限；提交时按最新一条读数的最终更正值复核新温区，越界且未隔离将立即隔离并使待确认交接失效；历史读数与隔离记录不回写，放宽温区不自动解除隔离。</p>
+  </div>
+</div>
+
+{% if pending %}
+<div class="card highlight">
+  <h3>待确认交接 #{{ pending.id }}</h3>
+  <p class="meta">
+    {{ pending.from_person }} → {{ pending.to_person }} ｜ 目的地：<b>{{ pending.destination }}</b> ｜
+    发起时间：{{ pending.created_at | dt }} {% if pending.note %}｜ 备注：{{ pending.note }}{% endif %}
+  </p>
+  <form method="post" action="/handovers/{{ pending.id }}/confirm">
+    <button type="submit" class="btn">接收人确认（确认后位置才变更）</button>
+  </form>
+</div>
+{% endif %}
+
+<div class="card">
+  <h3>流转时间线</h3>
+  <table>
+    <thead>
+      <tr><th>ID</th><th>交出人</th><th>接收人</th><th>目的地</th><th>状态</th><th>发起时间</th><th>处理时间</th></tr>
+    </thead>
+    <tbody>
+      {% for h in handovers %}
+      <tr>
+        <td>#{{ h.id }}</td>
+        <td>{{ h.from_person }}</td>
+        <td>{{ h.to_person }}</td>
+        <td>{{ h.destination }}</td>
+        <td>
+          {% if h.status == 'PENDING' %}<span class="badge pending">待确认</span>
+          {% elif h.status == 'CONFIRMED' %}<span class="badge ok">已确认</span>
+          {% else %}<span class="badge muted">已失效</span>{% endif %}
+        </td>
+        <td>{{ h.created_at | dt }}</td>
+        <td>{{ h.decided_at | dt }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">暂无交接记录</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3>温度读数与更正</h3>
+  <table>
+    <thead>
+      <tr><th>ID</th><th>原始值 (°C)</th><th>当前有效值 (°C)</th><th>越界</th><th>记录人</th><th>记录时间</th><th>更正记录 / 发起更正</th></tr>
+    </thead>
+    <tbody>
+      {% for r in readings %}
+      <tr class="{{ 'row-bad' if r.is_out_of_range else '' }}">
+        <td>#{{ r.id }}</td>
+        <td>{{ r.value }}</td>
+        <td><b>{{ effective[r.id] }}</b></td>
+        <td>{% if r.is_out_of_range %}<span class="badge bad">是</span>{% else %}否{% endif %}</td>
+        <td>{{ r.recorded_by }}</td>
+        <td>{{ r.recorded_at | dt }}</td>
+        <td>
+          {% for c in corrections_by_reading.get(r.id, []) %}
+          <div class="corr">更正 {{ c.old_value }} → {{ c.new_value }} ｜ {{ c.operator }} ｜ {{ c.created_at | dt }} ｜ 理由：{{ c.reason }}</div>
+          {% endfor %}
+          <form method="post" action="/readings/{{ r.id }}/corrections" class="inline-form">
+            <input name="new_value" type="number" step="0.1" required placeholder="新值">
+            <input name="reason" required placeholder="理由 *">
+            <input name="operator" required placeholder="操作者 *">
+            <button type="submit" class="btn small">更正</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">暂无温度读数</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">更正保留原值、理由与操作者；更正不会自动解除隔离。</p>
+</div>
+
+<div class="card">
+  <h3>温区调整记录</h3>
+  <table>
+    <thead>
+      <tr><th>ID</th><th>生效时间（提交时刻）</th><th>旧温区 (°C)</th><th>新温区 (°C)</th><th>理由</th><th>操作者</th><th>提交时复核（按最新读数最终更正值）</th></tr>
+    </thead>
+    <tbody>
+      {% for a in adjustments %}
+      <tr>
+        <td>#{{ a.id }}</td>
+        <td>{{ a.effective_at | dt }}</td>
+        <td>{{ a.old_min }} ~ {{ a.old_max }}</td>
+        <td><b>{{ a.new_min }} ~ {{ a.new_max }}</b></td>
+        <td>{{ a.reason }}</td>
+        <td>{{ a.operator }}</td>
+        <td>
+          {% if a.review_action == 'NO_READING' %}
+            <span class="badge muted">无读数，仅更新温区</span>
+          {% else %}
+            读数 #{{ a.review_reading_id }} 最终更正值 <b>{{ a.review_value }}°C</b> ｜
+            {% if a.review_action == 'IN_RANGE' %}
+              <span class="badge ok">复核未越界</span>
+            {% elif a.review_action == 'QUARANTINED' %}
+              <span class="badge bad">复核越界 · 本次隔离</span>
+            {% else %}
+              <span class="badge bad">复核越界 · 已隔离仅记录</span>
+            {% endif %}
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">暂无温区调整记录</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">调整以提交时刻生效；历史读数原值、更正链、当时越界判定与已形成的隔离记录不回写；放宽温区不自动解除隔离。</p>
+</div>
+
+<div class="card">
+  <h3>异常记录（隔离）</h3>
+  <table>
+    <thead>
+      <tr><th>ID</th><th>原因 / 依据</th><th>状态</th><th>隔离时间</th><th>解除时间</th><th>复核结论</th><th>复核人</th></tr>
+    </thead>
+    <tbody>
+      {% for q in quarantines %}
+      <tr>
+        <td>#{{ q.id }}</td>
+        <td>
+          {{ q.reason }}
+          {% if q.failure_id %}<div class="hint">隔离依据：<a href="/failures/{{ q.failure_id }}">设备故障 #{{ q.failure_id }}</a></div>{% endif %}
+        </td>
+        <td>
+          {% if q.status == 'ACTIVE' %}<span class="badge bad">隔离中</span>
+          {% else %}<span class="badge ok">已解除</span>{% endif %}
+        </td>
+        <td>{{ q.quarantined_at | dt }}</td>
+        <td>{{ q.released_at | dt }}</td>
+        <td>{{ q.release_reason or '-' }}</td>
+        <td>{{ q.released_by or '-' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">暂无异常记录</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3>审计时间线</h3>
+  <ul class="timeline">
+    {% for a in audits %}
+    <li>
+      <span class="time">{{ a.created_at | dt }}</span>
+      <b>{{ event_names.get(a.event_type, a.event_type) }}</b>
+      <span class="actor">{{ a.actor or '-' }}</span>
+      <code>{{ a.detail | json_detail }}</code>
+    </li>
+    {% else %}
+    <li class="empty">暂无审计记录</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endblock %}

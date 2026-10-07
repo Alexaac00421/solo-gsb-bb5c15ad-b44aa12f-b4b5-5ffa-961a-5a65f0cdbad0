@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}故障 {{ failure.code }}{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-head">
+    <h2>设备故障 {{ failure.code }}</h2>
+    <a class="btn" href="/failures">返回故障列表</a>
+  </div>
+  <p class="meta">
+    库位：<b>{{ failure.location }}</b> ｜
+    故障时段（左闭右开）：<b>{{ failure.start_time | dt }} ~ {{ failure.end_time | dt }}</b><br>
+    原因：<b>{{ failure.reason }}</b> ｜ 操作者：<b>{{ failure.operator }}</b> ｜
+    登记时间：{{ failure.created_at | dt }}
+  </p>
+</div>
+
+<div class="card">
+  <h3>受影响样品清单（登记时一次性固定）</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>样品</th><th>重叠时段（左闭右开）</th><th>重叠时长</th>
+        <th>位置时段依据</th><th>登记时隔离状态</th><th>本次处理</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for imp in impacts %}
+      {% set s = sample_map.get(imp.sample_id) %}
+      <tr>
+        <td>{% if s %}<a href="/samples/{{ s.id }}"><b>{{ s.code }}</b></a>{% else %}#{{ imp.sample_id }}{% endif %}</td>
+        <td>{{ imp.overlap_start | dt }} ~ {{ imp.overlap_end | dt }}</td>
+        <td>{{ [imp.overlap_start, imp.overlap_end] | minutes_between }} 分钟</td>
+        <td>
+          {{ imp.segment_start | dt }} ~ {{ imp.segment_end | dt if imp.segment_end else '在库至今' }}
+          <span class="hint">（{{ failure.location }}）</span>
+        </td>
+        <td>
+          {% if imp.was_quarantined %}<span class="badge bad">已隔离</span>
+          {% else %}<span class="badge ok">未隔离</span>{% endif %}
+        </td>
+        <td>
+          {% if imp.was_quarantined %}仅关联本故障，不重复隔离
+          {% else %}已隔离 · 待确认交接失效{% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="empty">无受影响样品：没有样品在「{{ failure.location }}」与故障时段有位置时间交集（空清单已保存）</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3>隔离依据</h3>
+  <table>
+    <thead>
+      <tr><th>隔离记录</th><th>样品</th><th>原因</th><th>状态</th><th>隔离时间</th><th>解除（复核）</th></tr>
+    </thead>
+    <tbody>
+      {% for q in quarantines %}
+      {% set s = sample_map.get(q.sample_id) %}
+      <tr>
+        <td>#{{ q.id }}</td>
+        <td>{% if s %}<a href="/samples/{{ s.id }}">{{ s.code }}</a>{% else %}#{{ q.sample_id }}{% endif %}</td>
+        <td>{{ q.reason }}</td>
+        <td>
+          {% if q.status == 'ACTIVE' %}<span class="badge bad">隔离中</span>
+          {% else %}<span class="badge ok">已解除</span>{% endif %}
+        </td>
+        <td>{{ q.quarantined_at | dt }}</td>
+        <td>
+          {% if q.status == 'RELEASED' %}
+            {{ q.released_at | dt }} ｜ {{ q.released_by }}：{{ q.release_reason }}
+          {% else %}
+            <span class="hint">到样品详情页走「注明理由的复核结论」流程解除</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="empty">本故障未新增隔离记录（受影响样品登记时均已隔离，仅做关联）</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">解除隔离不提供快捷入口，仍须在样品详情页填写复核人、复核结论并按最新状态版本提交。</p>
+</div>
+
+<div class="card">
+  <h3>失效的待确认交接</h3>
+  <table>
+    <thead>
+      <tr><th>交接</th><th>样品</th><th>交出人</th><th>接收人</th><th>目的地</th><th>失效时间</th></tr>
+    </thead>
+    <tbody>
+      {% for h in invalidated %}
+      {% set s = sample_map.get(h.sample_id) %}
+      <tr>
+        <td>#{{ h.id }}</td>
+        <td>{% if s %}<a href="/samples/{{ s.id }}">{{ s.code }}</a>{% else %}#{{ h.sample_id }}{% endif %}</td>
+        <td>{{ h.from_person }}</td>
+        <td>{{ h.to_person }}</td>
+        <td>{{ h.destination }}</td>
+        <td>{{ h.decided_at | dt }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="empty">无待确认交接因此次故障失效</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: labpass
+      POSTGRES_DB: labdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d labdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    ports:
+      - "5432:5432"
+
+  web:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg2://lab:labpass@db:5432/labdb
+      SEED_DEMO: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

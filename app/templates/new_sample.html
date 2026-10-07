@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}录入样品{% endblock %}
+{% block content %}
+<div class="card narrow">
+  <h2>录入样品</h2>
+  <form method="post" action="/samples" class="form">
+    <label>样品编号 *
+      <input name="code" required placeholder="如 SMP-2026-0001">
+    </label>
+    <label>允许温区下限 (°C) *
+      <input name="temp_min" type="number" step="0.1" required placeholder="如 2">
+    </label>
+    <label>允许温区上限 (°C) *
+      <input name="temp_max" type="number" step="0.1" required placeholder="如 8">
+    </label>
+    <label>当前位置 *
+      <input name="location" required placeholder="如 冷库A-01">
+    </label>
+    <label>操作人
+      <input name="operator" placeholder="选填">
+    </label>
+    <button type="submit" class="btn">提交</button>
+  </form>
+</div>
+{% endblock %}

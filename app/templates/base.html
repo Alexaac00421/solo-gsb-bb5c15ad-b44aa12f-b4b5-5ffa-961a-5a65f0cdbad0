@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}实验室样品流转系统{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1><a href="/">实验室样品流转系统</a></h1>
+  <nav>
+    <a href="/">样品列表</a>
+    <a href="/samples/new">录入样品</a>
+    <a href="/failures">设备故障</a>
+    <a href="/export.csv">导出全部审计</a>
+  </nav>
+</header>
+<main>
+  {% if msg %}
+  <div class="flash {{ level or 'success' }}">{{ msg }}</div>
+  {% endif %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>
