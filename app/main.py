@@ -7,8 +7,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
+from datetime import timezone
+
 from fastapi import Depends, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
@@ -16,7 +18,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from . import services
-from .database import Base, SessionLocal, engine, get_db
+from .database import Base, SessionLocal, engine, get_db, get_report_db
 from .models import (AuditLog, EquipmentFailure, FailureImpact, Handover,
                      QuarantineRecord, ReadingCorrection, Sample,
                      TempRangeAdjustment, TemperatureReading)
@@ -141,7 +143,22 @@ def fmt_dt(value) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def fmt_utc(value) -> str:
+    """证据报告：统一按 UTC 展示（ISO，秒级），与页面输入的 UTC 时间一致。"""
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    if value.tzinfo is None:  # SQLite 取回的无时区值按 UTC 解释
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 templates.env.filters["dt"] = fmt_dt
+templates.env.filters["utc"] = fmt_utc
+templates.env.filters["localdt"] = lambda value: (
+    value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M") if value else "")
+templates.env.filters["urlencode"] = lambda value: quote(str(value), safe="")
 templates.env.filters["json_detail"] = lambda d: json.dumps(d or {}, ensure_ascii=False)
 
 
@@ -285,6 +302,108 @@ def sample_detail(sample_id: int, request: Request, db: Session = Depends(get_db
                   quarantines=quarantines, audits=audits, pending=pending,
                   failure_map=failure_map, impacts_by_failure=impacts_by_failure,
                   adjustments=adjustments, event_names=EVENT_NAMES)
+
+
+# ---------------------------------------------------------------- 历史温控证据报告
+
+VERDICT_LABELS = {
+    "NON_COMPLIANT": "不符合（按最终值存在越界和/或与已固定故障时段相交）",
+    "INCONCLUSIVE": "无法判定合规（证据不足，本报告任何情况下均不作合规结论）",
+}
+
+
+def _evidence_context(sample_id: int, start_raw: str, end_raw: str,
+                      db: Session) -> dict:
+    report = services.build_evidence_report(db, sample_id, start_raw, end_raw)
+    report["verdict_label"] = VERDICT_LABELS[report["verdict"]]
+    return report
+
+
+@app.get("/samples/{sample_id}/evidence", response_class=HTMLResponse)
+def evidence_report(sample_id: int, request: Request,
+                    start: str = "", end: str = "",
+                    db: Session = Depends(get_report_db)):
+    try:
+        report = _evidence_context(sample_id, start, end, db)
+    except DomainError as e:
+        return render(request, "evidence_error.html", status_code=e.status_code,
+                      sample_id=sample_id, start=start, end=end, message=e.message)
+    return render(request, "evidence_report.html", report=report)
+
+
+def _evidence_csv(report: dict) -> str:
+    """与证据报告页面同内容的 CSV（UTF-8 BOM，Excel 可直接打开）。"""
+    buf = io.StringIO()
+    buf.write("﻿")
+    writer = csv.writer(buf)
+    sample = report["sample"]
+    writer.writerow(["历史温控证据报告（左闭右开，UTC，只读一致快照，非合规证明）"])
+    writer.writerow(["样品ID", sample.id, "样品编号", sample.code])
+    writer.writerow(["查询起始[", fmt_utc(report["start"])])
+    writer.writerow(["查询结束)", fmt_utc(report["end"])])
+    writer.writerow(["报告生成时刻(UTC)", fmt_utc(report["generated_at"])])
+    writer.writerow(["结论", report["verdict_label"]])
+    writer.writerow([])
+    writer.writerow(["一、窗内读数（按记录时刻升序；越界以最终更正值对照记录时生效温区判定，"
+                     "原始越界判定保留）"])
+    writer.writerow(["读数ID", "记录时刻(UTC)", "原始值(°C)", "最终更正值(°C)",
+                     "记录时允许下限(°C)", "记录时允许上限(°C)", "生效温区依据",
+                     "所在库位", "库位依据", "最终值越界", "原始越界判定", "记录人"])
+    if report["rows"]:
+        for r in report["rows"]:
+            writer.writerow([
+                r["reading_id"], fmt_utc(r["recorded_at"]),
+                r["original_value"], r["final_value"],
+                r["range_min"], r["range_max"],
+                ("初始温区" if r["range_adjustment_id"] is None
+                 else f"温区调整#{r['range_adjustment_id']}"),
+                r["location"],
+                ("登记位置" if r["location_handover_id"] is None
+                 else f"已确认交接#{r['location_handover_id']}"),
+                "是" if r["final_out_of_range"] else "否",
+                "是" if r["original_out_of_range"] else "否",
+                r["recorded_by"],
+            ])
+    else:
+        writer.writerow(["窗内无温度读数（不判合规）"])
+    writer.writerow([])
+    writer.writerow(["二、已固定故障影响清单中与查询窗相交的故障及交集时段"])
+    writer.writerow(["故障ID", "故障编号", "库位", "故障开始[ (UTC)", "故障结束) (UTC)",
+                     "交集起[ (UTC)", "交集止) (UTC)", "登记时样品状态", "故障原因", "操作者"])
+    if report["failure_rows"]:
+        for fr in report["failure_rows"]:
+            f, imp = fr["failure"], fr["impact"]
+            writer.writerow([
+                f.id, f.code, f.location,
+                fmt_utc(f.start_time), fmt_utc(f.end_time),
+                fmt_utc(fr["intersect_start"]), fmt_utc(fr["intersect_end"]),
+                ("已隔离·仅关联" if imp.was_quarantined else "未隔离·本次隔离"),
+                f.reason, f.operator,
+            ])
+    else:
+        writer.writerow(["无相交故障"])
+    writer.writerow([])
+    writer.writerow(["三、结论说明（仅列事实，任何情况下均不构成合规证明；"
+                     "报告为生成时刻的一致性快照，不改变隔离、交接与历史审计）"])
+    for i, reason in enumerate(report["reasons"], 1):
+        writer.writerow([f"{i}.", reason])
+    return buf.getvalue()
+
+
+@app.get("/samples/{sample_id}/evidence.csv")
+def evidence_report_csv(sample_id: int, start: str = "", end: str = "",
+                        db: Session = Depends(get_report_db)):
+    try:
+        report = _evidence_context(sample_id, start, end, db)
+    except DomainError as e:
+        return PlainTextResponse(f"证据报告无法生成：{e.message}\n",
+                                 status_code=e.status_code,
+                                 media_type="text/plain; charset=utf-8")
+    stamp = report["generated_at"].astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"evidence_{report['sample'].code}_{stamp}.csv"
+    return Response(
+        content=_evidence_csv(report), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 # ---------------------------------------------------------------- 操作

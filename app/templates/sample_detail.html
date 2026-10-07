@@ -17,6 +17,20 @@
   </p>
 </div>
 
+<div class="card info">
+  <h3>历史温控证据报告（UTC 时间窗，左闭右开）</h3>
+  <form method="get" action="/samples/{{ sample.id }}/evidence" class="inline-form">
+    <label>起始时间 *<input type="datetime-local" step="1" name="start" required></label>
+    <label>结束时间 *<input type="datetime-local" step="1" name="end" required></label>
+    <button type="submit" class="btn">查看报告</button>
+  </form>
+  <p class="hint">
+    报告逐条列出窗内读数的原值、最终更正值、记录时生效允许温区与所在库位（最终值标示越界、保留原始越界判定），
+    并列出已固定故障影响清单中与时间窗相交的故障及交集时段；窗内无读数也展示故障，且任何情况下均不判合规。
+    页面内可下载同内容 CSV。起始须早于结束，结束不晚于当前时间（UTC）。
+  </p>
+</div>
+
 {% if sample.status == 'QUARANTINED' %}
 <div class="card warn">
   <h3>解除隔离（须填写注明理由的复核结论）</h3>

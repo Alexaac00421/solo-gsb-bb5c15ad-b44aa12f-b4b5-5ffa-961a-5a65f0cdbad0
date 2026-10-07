@@ -581,3 +581,198 @@ def register_failure(db: Session, code: str, location: str,
     # ---- 5. 原子提交；空清单同样保存（仅故障行，无影响行）----
     db.commit()
     return failure, True, impacts
+
+
+# ---------------------------------------------------------------- 历史温控证据报告（只读）
+
+def _applicable_range(initial_min: float, initial_max: float,
+                      adjustments: list[TempRangeAdjustment],
+                      at: datetime) -> tuple[float, float, int | None]:
+    """读数时刻生效的允许温区：取生效时间不晚于 at 的最后一次调整。
+
+    adjustments 已按 (effective_at, id) 升序；同一生效时刻多条调整时，
+    循环推进到最后一条即等价于「记录 ID 较大者优先」。无调整时返回初始温区。
+    """
+    chosen = None
+    for adj in adjustments:
+        if _as_utc(adj.effective_at) <= at:
+            chosen = adj
+        else:
+            break
+    if chosen is None:
+        return initial_min, initial_max, None
+    return chosen.new_min, chosen.new_max, chosen.id
+
+
+def _applicable_location(initial: str, confirmed: list[Handover],
+                         at: datetime) -> tuple[str, int | None]:
+    """读数时刻所在库位：取确认时间不晚于 at 的最后一次已确认交接的目的地。
+
+    confirmed 已按 (decided_at, id) 升序；同一确认时刻按记录 ID 较大者优先；
+    此前位于样品登记位置。待确认/已失效交接不参与（上游已过滤）。
+    """
+    chosen = None
+    for h in confirmed:
+        decided = _as_utc(h.decided_at or h.created_at)
+        if decided <= at:
+            chosen = h
+        else:
+            break
+    if chosen is None:
+        return initial, None
+    return chosen.destination, chosen.id
+
+
+def build_evidence_report(db: Session, sample_id: int,
+                          start_raw: str, end_raw: str) -> dict:
+    """按 UTC 时间窗 [start, end) 构建样品的历史温控证据报告（纯只读）。
+
+    - 时间窗左闭右开：起始必须早于结束、结束不晚于当前时刻，否则 DomainError(400)；
+      样品不存在 DomainError(404)。
+    - 逐条列出窗内读数：原值、最终更正值、记录时生效的允许温区、所在库位；
+      越界以最终更正值判定，同时保留读数落库时的原始越界判定。
+    - 温区取生效时间不晚于读数的最后一次调整（同刻取 ID 较大者），
+      库位取确认时间不晚于读数的最后一次已确认交接（同刻取 ID 较大者）。
+    - 另列「已固定」故障影响清单中与时间窗相交的故障及交集时段；
+      窗内无读数也列故障，且任何情况下都不输出合规结论。
+    调用方须提供一致性快照会话（PostgreSQL 下为 REPEATABLE READ 只读事务），
+    使读数、更正链、温区调整、交接、故障影响清单来自同一数据视图。
+    本函数不写入任何数据，不改变隔离、交接与历史审计。
+    """
+    start = parse_dt(start_raw, "查询起始时间")
+    end = parse_dt(end_raw, "查询结束时间")
+    if not start < end:
+        raise DomainError("时间窗无效：起始时间必须早于结束时间（时间段左闭右开）")
+    if end > _now():
+        raise DomainError("时间窗无效：结束时间不得晚于当前时间（UTC）")
+
+    sample = db.get(Sample, sample_id)
+    if sample is None:
+        raise DomainError("样品不存在", 404)
+
+    # ---- 温区调整链（全部读取，窗口前的调整同样决定读数时的生效温区）----
+    adjustments = db.scalars(
+        select(TempRangeAdjustment).where(TempRangeAdjustment.sample_id == sample_id)
+        .order_by(TempRangeAdjustment.effective_at.asc(),
+                  TempRangeAdjustment.id.asc())
+    ).all()
+    first_adj = adjustments[0] if adjustments else None
+    # 首次调整保存的旧温区即样品初始温区；从未调整过则取样品当前温区。
+    initial_min = first_adj.old_min if first_adj else sample.temp_min
+    initial_max = first_adj.old_max if first_adj else sample.temp_max
+
+    # ---- 已确认交接（库位时间线依据）----
+    confirmed = db.scalars(
+        select(Handover).where(Handover.sample_id == sample_id,
+                               Handover.status == "CONFIRMED")
+        .order_by(Handover.decided_at.asc(), Handover.id.asc())
+    ).all()
+    initial_location = sample.initial_location or sample.current_location
+
+    # ---- 窗内读数（左闭右开）+ 各自更正链的最终值 ----
+    all_readings = db.scalars(
+        select(TemperatureReading).where(TemperatureReading.sample_id == sample_id)
+        .order_by(TemperatureReading.recorded_at.asc(),
+                  TemperatureReading.id.asc())
+    ).all()
+    readings = [r for r in all_readings
+                if start <= _as_utc(r.recorded_at) < end]
+    correction_rows = db.scalars(
+        select(ReadingCorrection)
+        .where(ReadingCorrection.reading_id.in_([r.id for r in readings]))
+        .order_by(ReadingCorrection.reading_id.asc(), ReadingCorrection.id.asc())
+    ).all() if readings else []
+    final_by_reading: dict[int, float] = {}
+    for c in correction_rows:  # 同读数按 id 升序遍历，最后一条即最终更正值
+        final_by_reading[c.reading_id] = c.new_value
+
+    rows: list[dict] = []
+    for r in readings:
+        recorded_at = _as_utc(r.recorded_at)
+        final_value = final_by_reading.get(r.id, r.value)
+        rng_min, rng_max, range_adj_id = _applicable_range(
+            initial_min, initial_max, adjustments, recorded_at)
+        location, handover_id = _applicable_location(
+            initial_location, confirmed, recorded_at)
+        rows.append({
+            "reading_id": r.id,
+            "recorded_at": recorded_at,
+            "original_value": r.value,
+            "final_value": final_value,
+            "range_min": rng_min,
+            "range_max": rng_max,
+            "range_adjustment_id": range_adj_id,  # None 表示初始温区
+            "location": location,
+            "location_handover_id": handover_id,  # None 表示登记位置
+            "original_out_of_range": bool(r.is_out_of_range),
+            "final_out_of_range": final_value < rng_min or final_value > rng_max,
+            "recorded_by": r.recorded_by,
+        })
+
+    # ---- 已固定的故障影响清单中与查询窗相交者（不重新计算，不随后续状态变化）----
+    impacts = db.scalars(
+        select(FailureImpact).where(FailureImpact.sample_id == sample_id)
+        .order_by(FailureImpact.overlap_start.asc(), FailureImpact.id.asc())
+    ).all()
+    failure_ids = sorted({imp.failure_id for imp in impacts})
+    failure_map = {
+        f.id: f for f in db.scalars(
+            select(EquipmentFailure).where(EquipmentFailure.id.in_(failure_ids))
+        ).all()
+    } if failure_ids else {}
+    failure_rows: list[dict] = []
+    for imp in impacts:
+        failure = failure_map.get(imp.failure_id)
+        if failure is None:
+            continue
+        intersect_start = max(start, _as_utc(imp.overlap_start))
+        intersect_end = min(end, _as_utc(imp.overlap_end))
+        if intersect_start >= intersect_end:
+            continue  # 左闭右开：严格小于才算相交
+        failure_rows.append({
+            "failure": failure,
+            "impact": imp,
+            "intersect_start": intersect_start,
+            "intersect_end": intersect_end,
+        })
+
+    # ---- 汇总结论：只列证据，永不判合规 ----
+    final_bad = [row for row in rows if row["final_out_of_range"]]
+    original_only_bad = [row for row in rows
+                         if row["original_out_of_range"] and not row["final_out_of_range"]]
+    reasons: list[str] = []
+    if final_bad:
+        ids_text = "、".join(f"#{row['reading_id']}" for row in final_bad)
+        reasons.append(f"窗内 {len(final_bad)} 条读数按最终更正值对照记录时生效温区判定越界"
+                       f"（读数 {ids_text}）")
+    if failure_rows:
+        codes = "、".join(sorted({fr["failure"].code for fr in failure_rows}))
+        reasons.append(f"窗内与 {len(failure_rows)} 段已固定的设备故障影响时段相交"
+                       f"（故障编号：{codes}）")
+    if not rows:
+        reasons.append("查询窗内无温度读数，不能证明全程受控")
+    if not final_bad and rows and not failure_rows:
+        reasons.append("窗内读数最终值均未越界且无相交故障，但证据报告仅列事实，不作合规判定")
+    if original_only_bad:
+        ids_text = "、".join(f"#{row['reading_id']}" for row in original_only_bad)
+        reasons.append(f"另有 {len(original_only_bad)} 条读数仅原始判定越界、最终更正值未越界"
+                       f"（读数 {ids_text}）；原始越界判定保留不改写")
+    verdict = "NON_COMPLIANT" if (final_bad or failure_rows) else "INCONCLUSIVE"
+
+    return {
+        "sample": sample,
+        "start": start,
+        "end": end,
+        "generated_at": _now(),
+        "rows": rows,
+        "failure_rows": failure_rows,
+        "verdict": verdict,
+        "reasons": reasons,
+        "counts": {
+            "readings": len(rows),
+            "final_out_of_range": len(final_bad),
+            "original_only_out_of_range": len(original_only_bad),
+            "failure_segments": len(failure_rows),
+            "failures": len({fr["failure"].id for fr in failure_rows}),
+        },
+    }

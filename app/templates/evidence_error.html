@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}证据报告无法生成{% endblock %}
+{% block content %}
+<div class="card warn">
+  <h2>历史温控证据报告无法生成</h2>
+  <p class="bad-text">{{ message }}</p>
+  <p class="hint">
+    时间窗为 UTC 左闭右开区间 [起始, 结束)：起始必须早于结束，且结束不得晚于当前时间；
+    时间格式如 2026-10-06T14:30（按 UTC 解释）或 2026-10-06T14:30:00Z。
+  </p>
+  <form method="get" action="/samples/{{ sample_id }}/evidence" class="inline-form">
+    <label>起始时间 *<input type="datetime-local" step="1" name="start" value="{{ start }}" required></label>
+    <label>结束时间 *<input type="datetime-local" step="1" name="end" value="{{ end }}" required></label>
+    <button type="submit" class="btn">重新生成报告</button>
+  </form>
+  <p>
+    <a href="/samples/{{ sample_id }}">返回样品详情</a> ｜ <a href="/">返回样品列表</a>
+  </p>
+</div>
+{% endblock %}
